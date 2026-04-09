@@ -1552,7 +1552,8 @@ def render_recommendation_panel(env: HospitalEnv, predictor: StayDurationPredict
     recommended_action = dqn_action if dqn_action is not None else baseline_action
 
     hospital = st.session_state.get("authenticated_hospital")
-    partner_df = hospital_db.fetch_transfer_partners(hospital["hospital_id"]) if hospital else pd.DataFrame()
+    fetch_partners = getattr(hospital_db, "fetch_transfer_partners", None)
+    partner_df = fetch_partners(hospital["hospital_id"]) if (hospital and fetch_partners) else pd.DataFrame()
     if hospital:
         st.markdown("**External Partner Directory**")
         if partner_df.empty:
@@ -1575,13 +1576,15 @@ def render_recommendation_panel(env: HospitalEnv, predictor: StayDurationPredict
         if action_id == 5 and hospital:
             partner_name = selected_partner if selected_partner != "Other / Not Listed" else partner_text.strip()
             if partner_name:
-                hospital_db.record_external_transfer(
-                    hospital_id=hospital["hospital_id"],
-                    patient_id=patient_id_for_log,
-                    partner_name=partner_name,
-                    time_step=int(env.time_step),
-                    note=external_note.strip() if external_note else None,
-                )
+                record_external = getattr(hospital_db, "record_external_transfer", None)
+                if record_external:
+                    record_external(
+                        hospital_id=hospital["hospital_id"],
+                        patient_id=patient_id_for_log,
+                        partner_name=partner_name,
+                        time_step=int(env.time_step),
+                        note=external_note.strip() if external_note else None,
+                    )
         st.success(f"{label} | Reward: {reward:.2f}")
         return info
 
@@ -1628,18 +1631,22 @@ def render_recommendation_panel(env: HospitalEnv, predictor: StayDurationPredict
                     "recommended_action": int(recommended_action),
                     "selected_action": int(selected_action),
                 }
-                hospital_db.record_rl_feedback(
-                    hospital_id=hospital["hospital_id"],
-                    patient_id=int(current_patient.get("id", 0)),
-                    time_step=int(env.time_step),
-                    feedback_label=feedback_label.lower(),
-                    recommended_action=int(recommended_action),
-                    chosen_action=int(selected_action),
-                    feedback_score=float(feedback_score),
-                    note=feedback_note.strip() if feedback_note else None,
-                    state_json=json.dumps(payload),
-                )
-                st.success("Feedback saved. Thanks for guiding the model.")
+                record_feedback = getattr(hospital_db, "record_rl_feedback", None)
+                if record_feedback:
+                    record_feedback(
+                        hospital_id=hospital["hospital_id"],
+                        patient_id=int(current_patient.get("id", 0)),
+                        time_step=int(env.time_step),
+                        feedback_label=feedback_label.lower(),
+                        recommended_action=int(recommended_action),
+                        chosen_action=int(selected_action),
+                        feedback_score=float(feedback_score),
+                        note=feedback_note.strip() if feedback_note else None,
+                        state_json=json.dumps(payload),
+                    )
+                    st.success("Feedback saved. Thanks for guiding the model.")
+                else:
+                    st.error("Feedback logging is unavailable in this deployment.")
 
 
 def render_operations(env: HospitalEnv) -> None:
@@ -1671,7 +1678,8 @@ def render_operations(env: HospitalEnv) -> None:
     hospital = st.session_state.get("authenticated_hospital")
     if hospital:
         st.caption("Maintain partner hospitals to route external transfers when internal capacity is full.")
-        partners_df = hospital_db.fetch_transfer_partners(hospital["hospital_id"])
+        fetch_partners = getattr(hospital_db, "fetch_transfer_partners", None)
+        partners_df = fetch_partners(hospital["hospital_id"]) if fetch_partners else pd.DataFrame()
         if partners_df.empty:
             st.caption("No partner hospitals registered yet.")
         else:
@@ -1685,14 +1693,18 @@ def render_operations(env: HospitalEnv) -> None:
             partner_capacity = col4.number_input("Daily Capacity", min_value=0, max_value=1000, value=0)
             partner_submit = st.form_submit_button("Add / Update Partner")
             if partner_submit and partner_name.strip():
-                hospital_db.add_transfer_partner(
-                    hospital_id=hospital["hospital_id"],
-                    partner_name=partner_name.strip(),
-                    location=partner_location.strip() if partner_location else None,
-                    contact=partner_contact.strip() if partner_contact else None,
-                    max_daily_capacity=int(partner_capacity) if partner_capacity else None,
-                )
-                st.success("Partner saved.")
+                add_partner = getattr(hospital_db, "add_transfer_partner", None)
+                if add_partner:
+                    add_partner(
+                        hospital_id=hospital["hospital_id"],
+                        partner_name=partner_name.strip(),
+                        location=partner_location.strip() if partner_location else None,
+                        contact=partner_contact.strip() if partner_contact else None,
+                        max_daily_capacity=int(partner_capacity) if partner_capacity else None,
+                    )
+                    st.success("Partner saved.")
+                else:
+                    st.error("Partner management is unavailable in this deployment.")
 
         if not partners_df.empty:
             partner_map = {
@@ -1701,8 +1713,12 @@ def render_operations(env: HospitalEnv) -> None:
             }
             selected_partner_label = st.selectbox("Remove Partner", list(partner_map.keys()))
             if st.button("Remove Selected Partner"):
-                hospital_db.remove_transfer_partner(hospital["hospital_id"], partner_map[selected_partner_label])
-                st.success("Partner removed.")
+                remove_partner = getattr(hospital_db, "remove_transfer_partner", None)
+                if remove_partner:
+                    remove_partner(hospital["hospital_id"], partner_map[selected_partner_label])
+                    st.success("Partner removed.")
+                else:
+                    st.error("Partner management is unavailable in this deployment.")
 
     st.markdown("**Transfer Scheduler**")
     schedule_df = build_transfer_schedule(env, limit=8)
@@ -1824,7 +1840,8 @@ def render_operations(env: HospitalEnv) -> None:
 
         hospital = st.session_state.get("authenticated_hospital")
         if hospital:
-            external_df = hospital_db.fetch_external_transfers(hospital["hospital_id"])
+            fetch_external = getattr(hospital_db, "fetch_external_transfers", None)
+            external_df = fetch_external(hospital["hospital_id"]) if fetch_external else pd.DataFrame()
             if external_df.empty:
                 st.caption("No external partner transfers logged yet.")
             else:
@@ -1852,7 +1869,8 @@ def render_operations(env: HospitalEnv) -> None:
     with feedback_tab:
         hospital = st.session_state.get("authenticated_hospital")
         if hospital:
-            feedback_df = hospital_db.fetch_rl_feedback(hospital["hospital_id"])
+            fetch_feedback = getattr(hospital_db, "fetch_rl_feedback", None)
+            feedback_df = fetch_feedback(hospital["hospital_id"]) if fetch_feedback else pd.DataFrame()
             if feedback_df.empty:
                 st.caption("No RL feedback has been stored yet.")
             else:
