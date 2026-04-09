@@ -19,19 +19,7 @@ from evaluation.evaluate import compare_policies
 from models.dqn_model import DQN
 import utils.auth as auth_store
 from utils.helpers import ACTION_LABELS, format_metrics
-from utils.hospital_db import (
-    fetch_hospital_allocations,
-    fetch_hospital_patients,
-    initialize_hospital_db,
-    sync_hospital_snapshot,
-    record_rl_feedback,
-    fetch_rl_feedback,
-    fetch_transfer_partners,
-    add_transfer_partner,
-    remove_transfer_partner,
-    record_external_transfer,
-    fetch_external_transfers,
-)
+import utils.hospital_db as hospital_db
 from utils.stay_predictor import StayDurationPredictor
 
 
@@ -755,7 +743,7 @@ def persist_dashboard_state() -> None:
     if getattr(env, "last_tick_ts", None) is None:
         env.last_tick_ts = time.time()
     auth_store.save_hospital_state(hospital["hospital_id"], export_env_state(env))
-    sync_hospital_snapshot(hospital["hospital_id"], env, generate_bed_inventory(env))
+    hospital_db.sync_hospital_snapshot(hospital["hospital_id"], env, generate_bed_inventory(env))
 
 
 def get_env() -> HospitalEnv:
@@ -798,6 +786,16 @@ def build_patient_df(patients):
             for patient in patients
         ]
     )
+
+
+def safe_dataframe(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df
+    safe = df.copy()
+    for col in safe.columns:
+        if safe[col].dtype == "object":
+            safe[col] = safe[col].fillna("").astype(str)
+    return safe
 
 
 def style_patient_dataframe(df: pd.DataFrame):
@@ -1264,7 +1262,7 @@ def render_hospital_setup() -> None:
                 },
             ]
         )
-        st.dataframe(summary_df, width="stretch", hide_index=True)
+        st.dataframe(safe_dataframe(summary_df), width="stretch", hide_index=True)
         st.success("Hospital environment is already configured and ready for daily operations.")
         if st.button("Edit Hospital Configuration"):
             st.session_state.edit_hospital_config = True
@@ -1319,7 +1317,7 @@ def render_hospital_setup() -> None:
 
 def render_login() -> bool:
     auth_store.initialize_auth_db()
-    initialize_hospital_db()
+    hospital_db.initialize_hospital_db()
     render_section_intro(
         "Hospital Login",
         "Only authenticated hospitals can access their own dashboard and operational data.",
@@ -1554,13 +1552,13 @@ def render_recommendation_panel(env: HospitalEnv, predictor: StayDurationPredict
     recommended_action = dqn_action if dqn_action is not None else baseline_action
 
     hospital = st.session_state.get("authenticated_hospital")
-    partner_df = fetch_transfer_partners(hospital["hospital_id"]) if hospital else pd.DataFrame()
+    partner_df = hospital_db.fetch_transfer_partners(hospital["hospital_id"]) if hospital else pd.DataFrame()
     if hospital:
         st.markdown("**External Partner Directory**")
         if partner_df.empty:
             st.caption("No partner hospitals have been registered yet.")
         else:
-            st.dataframe(partner_df, width="stretch")
+            st.dataframe(safe_dataframe(partner_df), width="stretch")
     partner_names = partner_df["Partner Name"].tolist() if not partner_df.empty else []
     partner_options = partner_names + ["Other / Not Listed"] if partner_names else ["Other / Not Listed"]
     selected_partner = st.selectbox("External Transfer Partner", partner_options)
@@ -1577,7 +1575,7 @@ def render_recommendation_panel(env: HospitalEnv, predictor: StayDurationPredict
         if action_id == 5 and hospital:
             partner_name = selected_partner if selected_partner != "Other / Not Listed" else partner_text.strip()
             if partner_name:
-                record_external_transfer(
+                hospital_db.record_external_transfer(
                     hospital_id=hospital["hospital_id"],
                     patient_id=patient_id_for_log,
                     partner_name=partner_name,
@@ -1630,7 +1628,7 @@ def render_recommendation_panel(env: HospitalEnv, predictor: StayDurationPredict
                     "recommended_action": int(recommended_action),
                     "selected_action": int(selected_action),
                 }
-                record_rl_feedback(
+                hospital_db.record_rl_feedback(
                     hospital_id=hospital["hospital_id"],
                     patient_id=int(current_patient.get("id", 0)),
                     time_step=int(env.time_step),
@@ -1673,11 +1671,11 @@ def render_operations(env: HospitalEnv) -> None:
     hospital = st.session_state.get("authenticated_hospital")
     if hospital:
         st.caption("Maintain partner hospitals to route external transfers when internal capacity is full.")
-        partners_df = fetch_transfer_partners(hospital["hospital_id"])
+        partners_df = hospital_db.fetch_transfer_partners(hospital["hospital_id"])
         if partners_df.empty:
             st.caption("No partner hospitals registered yet.")
         else:
-            st.dataframe(partners_df, width="stretch")
+            st.dataframe(safe_dataframe(partners_df), width="stretch")
 
         with st.form("add_partner_form"):
             col1, col2, col3, col4 = st.columns(4)
@@ -1687,7 +1685,7 @@ def render_operations(env: HospitalEnv) -> None:
             partner_capacity = col4.number_input("Daily Capacity", min_value=0, max_value=1000, value=0)
             partner_submit = st.form_submit_button("Add / Update Partner")
             if partner_submit and partner_name.strip():
-                add_transfer_partner(
+                hospital_db.add_transfer_partner(
                     hospital_id=hospital["hospital_id"],
                     partner_name=partner_name.strip(),
                     location=partner_location.strip() if partner_location else None,
@@ -1703,7 +1701,7 @@ def render_operations(env: HospitalEnv) -> None:
             }
             selected_partner_label = st.selectbox("Remove Partner", list(partner_map.keys()))
             if st.button("Remove Selected Partner"):
-                remove_transfer_partner(hospital["hospital_id"], partner_map[selected_partner_label])
+                hospital_db.remove_transfer_partner(hospital["hospital_id"], partner_map[selected_partner_label])
                 st.success("Partner removed.")
 
     st.markdown("**Transfer Scheduler**")
@@ -1826,39 +1824,39 @@ def render_operations(env: HospitalEnv) -> None:
 
         hospital = st.session_state.get("authenticated_hospital")
         if hospital:
-            external_df = fetch_external_transfers(hospital["hospital_id"])
+            external_df = hospital_db.fetch_external_transfers(hospital["hospital_id"])
             if external_df.empty:
                 st.caption("No external partner transfers logged yet.")
             else:
                 st.markdown("**External Partner Transfers**")
-                st.dataframe(external_df, width="stretch")
+                st.dataframe(safe_dataframe(external_df), width="stretch")
 
     with database_tab:
         hospital = st.session_state.get("authenticated_hospital")
         if hospital:
-            patient_records_df = fetch_hospital_patients(hospital["hospital_id"])
+            patient_records_df = hospital_db.fetch_hospital_patients(hospital["hospital_id"])
             if patient_records_df.empty:
                 st.caption("No patient records have been stored in the database yet.")
             else:
-                st.dataframe(patient_records_df, width="stretch")
+                st.dataframe(safe_dataframe(patient_records_df), width="stretch")
 
     with allocation_tab:
         hospital = st.session_state.get("authenticated_hospital")
         if hospital:
-            allocation_df = fetch_hospital_allocations(hospital["hospital_id"])
+            allocation_df = hospital_db.fetch_hospital_allocations(hospital["hospital_id"])
             if allocation_df.empty:
                 st.caption("No allocation history has been stored yet.")
             else:
-                st.dataframe(allocation_df, width="stretch")
+                st.dataframe(safe_dataframe(allocation_df), width="stretch")
 
     with feedback_tab:
         hospital = st.session_state.get("authenticated_hospital")
         if hospital:
-            feedback_df = fetch_rl_feedback(hospital["hospital_id"])
+            feedback_df = hospital_db.fetch_rl_feedback(hospital["hospital_id"])
             if feedback_df.empty:
                 st.caption("No RL feedback has been stored yet.")
             else:
-                st.dataframe(feedback_df, width="stretch")
+                st.dataframe(safe_dataframe(feedback_df), width="stretch")
 
 
 def render_analytics() -> None:
@@ -1892,7 +1890,7 @@ def render_analytics() -> None:
                 for policy_name, policy_metrics in comparison.items()
             }
         )
-        st.dataframe(comparison_df, width="stretch")
+        st.dataframe(safe_dataframe(comparison_df), width="stretch")
 
 
 st.set_page_config(page_title="Hospital Bed Allocation Dashboard", layout="wide")
