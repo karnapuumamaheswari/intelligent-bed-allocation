@@ -67,10 +67,15 @@ def initialize_auth_db() -> None:
             completed_patients_json TEXT NOT NULL,
             transfer_log_json TEXT NOT NULL,
             utilization_samples_json TEXT NOT NULL,
+            last_tick_ts REAL,
             FOREIGN KEY (hospital_id) REFERENCES hospitals(hospital_id)
         )
         """
     )
+    try:
+        cursor.execute("ALTER TABLE hospital_states ADD COLUMN last_tick_ts REAL")
+    except sqlite3.OperationalError:
+        pass
 
     seed_rows = [
         ("City Care Hospital", "citycare", _hash_password("citycare123"), "Chennai"),
@@ -193,9 +198,9 @@ def save_hospital_state(hospital_id: int, state: Dict) -> None:
             total_reward, total_waiting_time, waiting_patients_processed, correct_allocations,
             wrong_allocations, external_transfers, internal_transfers, critical_delays,
             total_patients_seen, waiting_queue_json, active_patients_json, completed_patients_json,
-            transfer_log_json, utilization_samples_json
+            transfer_log_json, utilization_samples_json, last_tick_ts
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(hospital_id) DO UPDATE SET
             free_icu = excluded.free_icu,
             free_general = excluded.free_general,
@@ -215,7 +220,8 @@ def save_hospital_state(hospital_id: int, state: Dict) -> None:
             active_patients_json = excluded.active_patients_json,
             completed_patients_json = excluded.completed_patients_json,
             transfer_log_json = excluded.transfer_log_json,
-            utilization_samples_json = excluded.utilization_samples_json
+            utilization_samples_json = excluded.utilization_samples_json,
+            last_tick_ts = excluded.last_tick_ts
         """,
         (
             hospital_id,
@@ -238,6 +244,7 @@ def save_hospital_state(hospital_id: int, state: Dict) -> None:
             json.dumps(state["completed_patients"]),
             json.dumps(state["transfer_log"]),
             json.dumps(state["utilization_samples"]),
+            state.get("last_tick_ts"),
         ),
     )
     conn.commit()
@@ -254,7 +261,7 @@ def load_hospital_state(hospital_id: int) -> Optional[Dict]:
                total_reward, total_waiting_time, waiting_patients_processed, correct_allocations,
                wrong_allocations, external_transfers, internal_transfers, critical_delays,
                total_patients_seen, waiting_queue_json, active_patients_json, completed_patients_json,
-               transfer_log_json, utilization_samples_json
+               transfer_log_json, utilization_samples_json, last_tick_ts
         FROM hospital_states
         WHERE hospital_id = ?
         """,
@@ -286,4 +293,5 @@ def load_hospital_state(hospital_id: int) -> Optional[Dict]:
         "completed_patients": json.loads(row[16]),
         "transfer_log": json.loads(row[17]),
         "utilization_samples": json.loads(row[18]),
+        "last_tick_ts": row[19],
     }

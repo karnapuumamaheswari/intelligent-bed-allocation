@@ -12,6 +12,16 @@ pip install -r requirements.txt
 streamlit run dashboard/app.py
 ```
 
+3. (Optional) Train the RL policy:
+```powershell
+python training/train_dqn.py
+```
+
+4. (Optional) Compare DQN vs rule-based:
+```powershell
+python evaluation/evaluate.py
+```
+
 ## Deploy
 
 ### Streamlit Community Cloud
@@ -38,6 +48,8 @@ Start Command: streamlit run dashboard/app.py --server.port=$PORT --server.addre
 
 - SQLite databases are stored in `database/`.
 - Saved models are stored in `saved_models/`.
+- Staff feedback on RL recommendations is stored in `database/hospital_operations.db` under `rl_feedback`.
+- External transfer partners and external transfers are stored in `database/hospital_operations.db`.
 - For production demos, keep the same Python environment used for training/evaluation when possible.
 
 ## Demo Login

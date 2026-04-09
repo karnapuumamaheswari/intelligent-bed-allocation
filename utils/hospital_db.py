@@ -73,6 +73,49 @@ def initialize_hospital_db() -> None:
         )
         """
     )
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS transfer_partners (
+            partner_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            hospital_id INTEGER NOT NULL,
+            partner_name TEXT NOT NULL,
+            location TEXT,
+            contact TEXT,
+            max_daily_capacity INTEGER,
+            UNIQUE(hospital_id, partner_name)
+        )
+        """
+    )
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS external_transfers (
+            transfer_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            hospital_id INTEGER NOT NULL,
+            patient_id INTEGER NOT NULL,
+            partner_name TEXT NOT NULL,
+            time_step INTEGER NOT NULL,
+            note TEXT,
+            created_at TEXT DEFAULT (datetime('now'))
+        )
+        """
+    )
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS rl_feedback (
+            feedback_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            hospital_id INTEGER NOT NULL,
+            patient_id INTEGER NOT NULL,
+            time_step INTEGER NOT NULL,
+            recommended_action INTEGER,
+            chosen_action INTEGER,
+            feedback_label TEXT NOT NULL,
+            feedback_score REAL,
+            note TEXT,
+            state_json TEXT,
+            created_at TEXT DEFAULT (datetime('now'))
+        )
+        """
+    )
     conn.commit()
     conn.close()
 
@@ -211,6 +254,185 @@ def fetch_hospital_allocations(hospital_id: int) -> pd.DataFrame:
         FROM allocations
         WHERE hospital_id = ?
         ORDER BY allocation_id DESC
+        """,
+        conn,
+        params=(hospital_id,),
+    )
+    conn.close()
+    return df
+
+
+def fetch_transfer_partners(hospital_id: int) -> pd.DataFrame:
+    initialize_hospital_db()
+    conn = sqlite3.connect(HOSPITAL_DB_PATH)
+    df = pd.read_sql_query(
+        """
+        SELECT partner_id AS [Partner ID],
+               partner_name AS [Partner Name],
+               location AS [Location],
+               contact AS [Contact],
+               max_daily_capacity AS [Daily Capacity]
+        FROM transfer_partners
+        WHERE hospital_id = ?
+        ORDER BY partner_name
+        """,
+        conn,
+        params=(hospital_id,),
+    )
+    conn.close()
+    return df
+
+
+def add_transfer_partner(
+    hospital_id: int,
+    partner_name: str,
+    location: str = None,
+    contact: str = None,
+    max_daily_capacity: int = None,
+) -> None:
+    initialize_hospital_db()
+    conn = sqlite3.connect(HOSPITAL_DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        INSERT OR REPLACE INTO transfer_partners (
+            hospital_id, partner_name, location, contact, max_daily_capacity
+        )
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        (
+            int(hospital_id),
+            partner_name.strip(),
+            location.strip() if location else None,
+            contact.strip() if contact else None,
+            int(max_daily_capacity) if max_daily_capacity is not None else None,
+        ),
+    )
+    conn.commit()
+    conn.close()
+
+
+def remove_transfer_partner(hospital_id: int, partner_id: int) -> None:
+    initialize_hospital_db()
+    conn = sqlite3.connect(HOSPITAL_DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        DELETE FROM transfer_partners
+        WHERE hospital_id = ? AND partner_id = ?
+        """,
+        (int(hospital_id), int(partner_id)),
+    )
+    conn.commit()
+    conn.close()
+
+
+def record_external_transfer(
+    hospital_id: int,
+    patient_id: int,
+    partner_name: str,
+    time_step: int,
+    note: str = None,
+) -> None:
+    initialize_hospital_db()
+    conn = sqlite3.connect(HOSPITAL_DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        INSERT INTO external_transfers (
+            hospital_id, patient_id, partner_name, time_step, note
+        )
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        (
+            int(hospital_id),
+            int(patient_id),
+            partner_name.strip(),
+            int(time_step),
+            note.strip() if note else None,
+        ),
+    )
+    conn.commit()
+    conn.close()
+
+
+def fetch_external_transfers(hospital_id: int) -> pd.DataFrame:
+    initialize_hospital_db()
+    conn = sqlite3.connect(HOSPITAL_DB_PATH)
+    df = pd.read_sql_query(
+        """
+        SELECT transfer_id AS [Transfer ID],
+               patient_id AS [Patient ID],
+               partner_name AS [Partner Hospital],
+               time_step AS [Time Step],
+               note AS [Note],
+               created_at AS [Logged At]
+        FROM external_transfers
+        WHERE hospital_id = ?
+        ORDER BY transfer_id DESC
+        """,
+        conn,
+        params=(hospital_id,),
+    )
+    conn.close()
+    return df
+
+
+def record_rl_feedback(
+    hospital_id: int,
+    patient_id: int,
+    time_step: int,
+    feedback_label: str,
+    recommended_action: int = None,
+    chosen_action: int = None,
+    feedback_score: float = None,
+    note: str = None,
+    state_json: str = None,
+) -> None:
+    initialize_hospital_db()
+    conn = sqlite3.connect(HOSPITAL_DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        INSERT INTO rl_feedback (
+            hospital_id, patient_id, time_step, recommended_action, chosen_action,
+            feedback_label, feedback_score, note, state_json
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            hospital_id,
+            int(patient_id),
+            int(time_step),
+            recommended_action if recommended_action is None else int(recommended_action),
+            chosen_action if chosen_action is None else int(chosen_action),
+            feedback_label,
+            feedback_score,
+            note,
+            state_json,
+        ),
+    )
+    conn.commit()
+    conn.close()
+
+
+def fetch_rl_feedback(hospital_id: int) -> pd.DataFrame:
+    initialize_hospital_db()
+    conn = sqlite3.connect(HOSPITAL_DB_PATH)
+    df = pd.read_sql_query(
+        """
+        SELECT feedback_id AS [Feedback ID],
+               patient_id AS [Patient ID],
+               time_step AS [Time Step],
+               recommended_action AS [Recommended Action],
+               chosen_action AS [Chosen Action],
+               feedback_label AS [Feedback],
+               feedback_score AS [Score],
+               note AS [Note],
+               created_at AS [Logged At]
+        FROM rl_feedback
+        WHERE hospital_id = ?
+        ORDER BY feedback_id DESC
         """,
         conn,
         params=(hospital_id,),

@@ -1,6 +1,8 @@
 import os
 import sys
 import inspect
+import json
+import time
 from typing import Dict, Optional, Tuple
 
 import numpy as np
@@ -22,6 +24,13 @@ from utils.hospital_db import (
     fetch_hospital_patients,
     initialize_hospital_db,
     sync_hospital_snapshot,
+    record_rl_feedback,
+    fetch_rl_feedback,
+    fetch_transfer_partners,
+    add_transfer_partner,
+    remove_transfer_partner,
+    record_external_transfer,
+    fetch_external_transfers,
 )
 from utils.stay_predictor import StayDurationPredictor
 
@@ -638,6 +647,7 @@ def export_env_state(env: HospitalEnv) -> Dict:
         "completed_patients": env.completed_patients,
         "transfer_log": env.transfer_log,
         "utilization_samples": env.utilization_samples,
+        "last_tick_ts": getattr(env, "last_tick_ts", None),
     }
 
 
@@ -717,7 +727,24 @@ def restore_env_state(env: HospitalEnv, state: Dict) -> HospitalEnv:
     rebuild_bed_state(env)
     env.utilization_samples = state["utilization_samples"] or [env._occupancy_rate()]
     env.current_patient = env.waiting_queue[0] if env.waiting_queue else None
+    env.last_tick_ts = state.get("last_tick_ts")
     return env
+
+
+def apply_real_time_progress(env: HospitalEnv) -> None:
+    now_ts = time.time()
+    last_ts = getattr(env, "last_tick_ts", None)
+    if last_ts is None:
+        env.last_tick_ts = now_ts
+        return
+
+    elapsed_days = int((now_ts - last_ts) // 86400)
+    if elapsed_days <= 0:
+        return
+
+    for _ in range(elapsed_days):
+        env.step(3)
+    env.last_tick_ts = last_ts + (elapsed_days * 86400)
 
 
 def persist_dashboard_state() -> None:
@@ -725,6 +752,8 @@ def persist_dashboard_state() -> None:
     env = st.session_state.get("dashboard_env")
     if not hospital or env is None:
         return
+    if getattr(env, "last_tick_ts", None) is None:
+        env.last_tick_ts = time.time()
     auth_store.save_hospital_state(hospital["hospital_id"], export_env_state(env))
     sync_hospital_snapshot(hospital["hospital_id"], env, generate_bed_inventory(env))
 
@@ -738,12 +767,14 @@ def get_env() -> HospitalEnv:
             saved_state = auth_store.load_hospital_state(hospital["hospital_id"])
             if saved_state:
                 env = restore_env_state(env, saved_state)
+        apply_real_time_progress(env)
         st.session_state.dashboard_env = env
     return st.session_state.dashboard_env
 
 
 def reset_env() -> None:
     st.session_state.dashboard_env = build_env_from_config(get_hospital_config_state())
+    st.session_state.dashboard_env.last_tick_ts = time.time()
     persist_dashboard_state()
 
 
@@ -790,11 +821,26 @@ def style_patient_dataframe(df: pd.DataFrame):
         }
         return palette.get(str(value).lower(), "")
 
+    def stay_style(value):
+        try:
+            days = int(value)
+        except (TypeError, ValueError):
+            return ""
+        if days <= 1:
+            return "background-color: #fde2e2; color: #991b1b; font-weight: 700;"
+        if days <= 2:
+            return "background-color: #fff7ed; color: #9a3412; font-weight: 700;"
+        if days <= 3:
+            return "background-color: #fef9c3; color: #854d0e; font-weight: 700;"
+        return ""
+
     styled = df.style
     if "Severity" in df.columns:
         styled = styled.map(severity_style, subset=["Severity"])
     if "Status" in df.columns:
         styled = styled.map(status_style, subset=["Status"])
+    if "Stay Left" in df.columns:
+        styled = styled.map(stay_style, subset=["Stay Left"])
     return styled
 
 
@@ -864,6 +910,10 @@ def build_status_snapshot(env: HospitalEnv) -> Dict:
     free_beds = env.free_icu + env.free_general + env.free_isolation
     occupancy_rate = (total_beds - free_beds) / total_beds if total_beds else 0.0
 
+    critical_pressure = waiting_critical > 0
+    occupancy_pressure = occupancy_rate >= 0.9
+    queue_pressure = len(env.waiting_queue) >= 8
+
     return {
         "free_icu": env.free_icu,
         "free_general": env.free_general,
@@ -877,6 +927,12 @@ def build_status_snapshot(env: HospitalEnv) -> Dict:
         "completed_patients": len(env.completed_patients),
         "transfers": getattr(env, "transfer_count", 0),
         "current_patient": getattr(env, "current_patient", None),
+        "discharge_alerts": sum(
+            1 for patient in env.active_patients if int(patient.get("remaining_stay", 9999)) <= 2
+        ),
+        "critical_pressure": critical_pressure,
+        "occupancy_pressure": occupancy_pressure,
+        "queue_pressure": queue_pressure,
     }
 
 
@@ -935,6 +991,72 @@ def get_capacity_guidance(env: HospitalEnv, patient: Dict) -> Dict[str, str]:
         "status": "external_transfer_risk",
         "message": f"No {required_bed} bed is currently available and no near discharge is visible.",
     }
+
+
+def get_internal_transfer_suggestion(env: HospitalEnv, patient: Dict) -> Optional[Dict]:
+    if not hasattr(env, "_find_transfer_candidate"):
+        return None
+    candidate = env._find_transfer_candidate(patient.get("required_bed", "General"))
+    if not candidate:
+        return None
+    transfer_patient, target_bed = candidate
+    return {
+        "patient_name": transfer_patient.get("name", f"Patient {transfer_patient.get('id', '')}"),
+        "from_bed": transfer_patient.get("assigned_bed", ""),
+        "from_bed_no": transfer_patient.get("assigned_bed_no", ""),
+        "to_bed": target_bed,
+        "severity": transfer_patient.get("severity", ""),
+    }
+
+
+def build_transfer_schedule(env: HospitalEnv, limit: int = 6) -> pd.DataFrame:
+    if not env.waiting_queue:
+        return pd.DataFrame()
+
+    def severity_rank(value: str) -> int:
+        return {"critical": 0, "moderate": 1, "stable": 2}.get(str(value).lower(), 3)
+
+    waiting_sorted = sorted(
+        [normalize_patient_record(patient) for patient in env.waiting_queue],
+        key=lambda patient: (severity_rank(patient.get("severity", "")), patient.get("waiting_time", 0)),
+    )
+
+    rows = []
+    for patient in waiting_sorted[:limit]:
+        guidance = get_capacity_guidance(env, patient)
+        transfer_hint = get_internal_transfer_suggestion(env, patient)
+        discharge_hint = get_next_discharge_info(env, patient.get("required_bed", "General"))
+
+        recommendation = "Review case"
+        eta = "Now"
+        if guidance["status"] == "available_now":
+            recommendation = "Assign bed now"
+        elif transfer_hint:
+            recommendation = (
+                f"Internal transfer: move {transfer_hint['patient_name']} "
+                f"to {transfer_hint['to_bed']}"
+            )
+        elif discharge_hint:
+            eta = f"{discharge_hint['remaining_stay']} step(s)"
+            recommendation = (
+                f"Wait for discharge of {discharge_hint['patient_name']} "
+                f"from {discharge_hint['bed_number']}"
+            )
+        else:
+            recommendation = "Consider external transfer"
+
+        rows.append(
+            {
+                "Patient": patient.get("name", f"Patient {patient.get('id', 0)}"),
+                "Severity": patient.get("severity", ""),
+                "Required Bed": patient.get("required_bed", ""),
+                "Waiting Time": patient.get("waiting_time", 0),
+                "Recommended Action": recommendation,
+                "ETA": eta,
+            }
+        )
+
+    return pd.DataFrame(rows)
 
 
 def available_bed_numbers(env: HospitalEnv, bed_type: str):
@@ -1025,6 +1147,19 @@ def admit_patient_immediately(env: HospitalEnv, patient: Dict) -> bool:
     if patient["required_bed"] == "General":
         return env._allocate_bed("General", patient)
     return env._allocate_bed("Isolation", patient)
+
+
+def discharge_patient(env: HospitalEnv, patient_id: int) -> bool:
+    if not hasattr(env, "_release_bed"):
+        return False
+    target = next((p for p in env.active_patients if int(p.get("id", 0)) == int(patient_id)), None)
+    if not target:
+        return False
+    env._release_bed(target.get("assigned_bed", ""), target.get("assigned_bed_no"))
+    target["status"] = "discharged"
+    env.active_patients = [p for p in env.active_patients if int(p.get("id", 0)) != int(patient_id)]
+    env.completed_patients.append(target)
+    return True
 
 
 def auto_assign_waiting_patients(env: HospitalEnv, max_patients: Optional[int] = None) -> Dict[str, int]:
@@ -1229,6 +1364,21 @@ def render_status(env: HospitalEnv) -> None:
         "Live Hospital Status",
         "Track current capacity, active admissions, critical queue load, and immediate bed availability.",
     )
+    alert_chips = []
+    if snapshot["critical_pressure"]:
+        alert_chips.append("Critical queue pressure")
+    if snapshot["occupancy_pressure"]:
+        alert_chips.append("High occupancy (≥90%)")
+    if snapshot["queue_pressure"]:
+        alert_chips.append("Queue backlog (≥8)")
+    if snapshot["discharge_alerts"] > 0:
+        alert_chips.append(f"{snapshot['discharge_alerts']} discharge alerts")
+    if alert_chips:
+        render_status_ribbon(
+            "SLA Alerts: immediate attention recommended.",
+            chips=alert_chips,
+        )
+
     col1, col2, col3, col4 = st.columns(4)
     col1.metric("ICU Beds", f"{snapshot['free_icu']} free / {env.total_icu_beds}")
     col2.metric("General Beds", f"{snapshot['free_general']} free / {env.total_general_beds}")
@@ -1310,18 +1460,11 @@ def render_patient_intake(env: HospitalEnv, predictor: StayDurationPredictor) ->
                 waiting_time=int(waiting_time),
                 predicted_stay=predicted_days,
             )
-            guidance = get_capacity_guidance(env, patient)
-            if guidance["status"] == "available_now" and admit_patient_immediately(env, patient):
-                persist_dashboard_state()
-                st.success(
-                    f"Patient registered and admitted immediately. Predicted hospital stay: {predicted_days} days."
-                )
-            else:
-                push_patient_to_queue(env, patient)
-                persist_dashboard_state()
-                st.success(
-                    f"Patient registered and added to queue. Predicted hospital stay: {predicted_days} days."
-                )
+            push_patient_to_queue(env, patient)
+            persist_dashboard_state()
+            st.success(
+                f"Patient registered and added to queue. Predicted hospital stay: {predicted_days} days."
+            )
 
 
 def render_recommendation_panel(env: HospitalEnv, predictor: StayDurationPredictor, model: Optional[DQN], model_note: Optional[str]) -> None:
@@ -1385,34 +1528,120 @@ def render_recommendation_panel(env: HospitalEnv, predictor: StayDurationPredict
     st.markdown("**Bed Availability Check**")
     st.write(capacity_guidance["message"])
 
+    st.markdown("**Transfer Outlook**")
+    discharge_hint = get_next_discharge_info(env, current_patient.get("required_bed", "General"))
+    if discharge_hint:
+        st.caption(
+            "Upcoming discharge: "
+            f"{discharge_hint['patient_name']} in {discharge_hint['remaining_stay']} step(s) "
+            f"from {discharge_hint['bed_number']} ({discharge_hint['severity']})."
+        )
+    transfer_hint = get_internal_transfer_suggestion(env, current_patient)
+    if transfer_hint:
+        st.caption(
+            "Internal transfer candidate: "
+            f"Move {transfer_hint['patient_name']} from {transfer_hint['from_bed']} "
+            f"{transfer_hint['from_bed_no']} to {transfer_hint['to_bed']}."
+        )
+
     suggested_beds = available_bed_numbers(env, current_patient.get("required_bed", "General"))
     if suggested_beds:
         st.caption(f"Suggested bed numbers for this patient: {', '.join(suggested_beds)}")
 
     action_map = {f"{action_id} - {label}": action_id for action_id, label in ACTION_LABELS.items()}
     selected_label = st.selectbox("Hospital Decision", list(action_map.keys()))
+    selected_action = action_map[selected_label]
+    recommended_action = dqn_action if dqn_action is not None else baseline_action
+
+    hospital = st.session_state.get("authenticated_hospital")
+    partner_df = fetch_transfer_partners(hospital["hospital_id"]) if hospital else pd.DataFrame()
+    if hospital:
+        st.markdown("**External Partner Directory**")
+        if partner_df.empty:
+            st.caption("No partner hospitals have been registered yet.")
+        else:
+            st.dataframe(partner_df, width="stretch")
+    partner_names = partner_df["Partner Name"].tolist() if not partner_df.empty else []
+    partner_options = partner_names + ["Other / Not Listed"] if partner_names else ["Other / Not Listed"]
+    selected_partner = st.selectbox("External Transfer Partner", partner_options)
+    partner_text = ""
+    if selected_partner == "Other / Not Listed":
+        partner_text = st.text_input("Partner Hospital Name", placeholder="Enter hospital name")
+    external_note = st.text_input("External Transfer Note (optional)", placeholder="Reason or transfer details")
+
+    patient_id_for_log = int(current_patient.get("id", 0))
+
+    def _apply_action(action_id: int, label: str):
+        _, reward, _, info = env.step(action_id)
+        persist_dashboard_state()
+        if action_id == 5 and hospital:
+            partner_name = selected_partner if selected_partner != "Other / Not Listed" else partner_text.strip()
+            if partner_name:
+                record_external_transfer(
+                    hospital_id=hospital["hospital_id"],
+                    patient_id=patient_id_for_log,
+                    partner_name=partner_name,
+                    time_step=int(env.time_step),
+                    note=external_note.strip() if external_note else None,
+                )
+        st.success(f"{label} | Reward: {reward:.2f}")
+        return info
 
     col1, col2, col3 = st.columns(3)
     if col1.button("Apply Selected Decision"):
-        _, reward, _, info = env.step(action_map[selected_label])
-        persist_dashboard_state()
-        st.success(f"Decision applied. Immediate reward: {reward:.2f}")
-        st.caption(f"Average waiting time is now {info['avg_waiting_time']:.2f}.")
+        if selected_action == 5 and selected_partner == "Other / Not Listed" and not partner_text.strip():
+            st.error("Please enter the partner hospital name for the external transfer.")
+        else:
+            info = _apply_action(selected_action, "Decision applied")
+            st.caption(f"Average waiting time is now {info['avg_waiting_time']:.2f}.")
 
     if col2.button("Apply Rule-Based Suggestion"):
-        _, reward, _, info = env.step(baseline_action)
-        persist_dashboard_state()
-        st.success(f"Applied: {ACTION_LABELS[baseline_action]} | Reward: {reward:.2f}")
-        st.caption(explain_recommendation(env, baseline_action))
+        if baseline_action == 5 and selected_partner == "Other / Not Listed" and not partner_text.strip():
+            st.error("Please enter the partner hospital name for the external transfer.")
+        else:
+            info = _apply_action(baseline_action, f"Applied: {ACTION_LABELS[baseline_action]}")
+            st.caption(explain_recommendation(env, baseline_action))
 
     if col3.button("Apply DQN Suggestion"):
         if dqn_action is None:
             st.error("DQN recommendation is unavailable. Train or reload the model first.")
         else:
-            _, reward, _, info = env.step(dqn_action)
-            persist_dashboard_state()
-            st.success(f"Applied: {ACTION_LABELS[dqn_action]} | Reward: {reward:.2f}")
-            st.caption(f"Decision accuracy is now {info['decision_accuracy']:.2%}.")
+            if dqn_action == 5 and selected_partner == "Other / Not Listed" and not partner_text.strip():
+                st.error("Please enter the partner hospital name for the external transfer.")
+            else:
+                info = _apply_action(dqn_action, f"Applied: {ACTION_LABELS[dqn_action]}")
+                st.caption(f"Decision accuracy is now {info['decision_accuracy']:.2%}.")
+
+    st.markdown("**Recommendation Feedback**")
+    with st.form("recommendation_feedback_form"):
+        feedback_label = st.selectbox("Was the recommendation correct?", ["Correct", "Incorrect", "Unsure"])
+        feedback_score = st.slider("Confidence", min_value=0, max_value=100, value=80, step=5)
+        feedback_note = st.text_area("Optional Note", placeholder="Explain why this recommendation was right or wrong.")
+        feedback_submitted = st.form_submit_button("Save Feedback")
+
+        if feedback_submitted:
+            hospital = st.session_state.get("authenticated_hospital")
+            if not hospital:
+                st.error("Log in to save feedback.")
+            else:
+                payload = {
+                    "state": env._get_state().tolist(),
+                    "patient": current_patient,
+                    "recommended_action": int(recommended_action),
+                    "selected_action": int(selected_action),
+                }
+                record_rl_feedback(
+                    hospital_id=hospital["hospital_id"],
+                    patient_id=int(current_patient.get("id", 0)),
+                    time_step=int(env.time_step),
+                    feedback_label=feedback_label.lower(),
+                    recommended_action=int(recommended_action),
+                    chosen_action=int(selected_action),
+                    feedback_score=float(feedback_score),
+                    note=feedback_note.strip() if feedback_note else None,
+                    state_json=json.dumps(payload),
+                )
+                st.success("Feedback saved. Thanks for guiding the model.")
 
 
 def render_operations(env: HospitalEnv) -> None:
@@ -1440,8 +1669,66 @@ def render_operations(env: HospitalEnv) -> None:
             f"Internal transfer: {summary['internal']}, External transfer: {summary['external']}."
         )
 
-    queue_tab, active_tab, transfer_tab, database_tab, allocation_tab = st.tabs(
-        ["Waiting Queue", "Admitted Patients", "Transfer Log", "Database Patients", "Allocation History"]
+    st.markdown("**External Transfer Network**")
+    hospital = st.session_state.get("authenticated_hospital")
+    if hospital:
+        st.caption("Maintain partner hospitals to route external transfers when internal capacity is full.")
+        partners_df = fetch_transfer_partners(hospital["hospital_id"])
+        if partners_df.empty:
+            st.caption("No partner hospitals registered yet.")
+        else:
+            st.dataframe(partners_df, width="stretch")
+
+        with st.form("add_partner_form"):
+            col1, col2, col3, col4 = st.columns(4)
+            partner_name = col1.text_input("Partner Name")
+            partner_location = col2.text_input("Location")
+            partner_contact = col3.text_input("Contact")
+            partner_capacity = col4.number_input("Daily Capacity", min_value=0, max_value=1000, value=0)
+            partner_submit = st.form_submit_button("Add / Update Partner")
+            if partner_submit and partner_name.strip():
+                add_transfer_partner(
+                    hospital_id=hospital["hospital_id"],
+                    partner_name=partner_name.strip(),
+                    location=partner_location.strip() if partner_location else None,
+                    contact=partner_contact.strip() if partner_contact else None,
+                    max_daily_capacity=int(partner_capacity) if partner_capacity else None,
+                )
+                st.success("Partner saved.")
+
+        if not partners_df.empty:
+            partner_map = {
+                f"{row['Partner Name']} (ID {row['Partner ID']})": int(row["Partner ID"])
+                for _, row in partners_df.iterrows()
+            }
+            selected_partner_label = st.selectbox("Remove Partner", list(partner_map.keys()))
+            if st.button("Remove Selected Partner"):
+                remove_transfer_partner(hospital["hospital_id"], partner_map[selected_partner_label])
+                st.success("Partner removed.")
+
+    st.markdown("**Transfer Scheduler**")
+    schedule_df = build_transfer_schedule(env, limit=8)
+    if schedule_df.empty:
+        st.caption("No waiting patients to schedule right now.")
+    else:
+        st.dataframe(style_patient_dataframe(schedule_df), width="stretch")
+
+    if env.current_patient:
+        current_hint = get_internal_transfer_suggestion(env, env.current_patient)
+        if current_hint and st.button("Apply Suggested Internal Transfer Now"):
+            _, reward, _, _ = env.step(4)
+            persist_dashboard_state()
+            st.success(f"Internal transfer completed. Reward: {reward:.2f}")
+
+    queue_tab, active_tab, transfer_tab, database_tab, allocation_tab, feedback_tab = st.tabs(
+        [
+            "Waiting Queue",
+            "Admitted Patients",
+            "Transfer Log",
+            "Database Patients",
+            "Allocation History",
+            "RL Feedback",
+        ]
     )
 
     with queue_tab:
@@ -1454,6 +1741,14 @@ def render_operations(env: HospitalEnv) -> None:
             ]
             queue_df["Capacity Note"] = [
                 get_capacity_guidance(env, patient)["message"] for patient in env.waiting_queue
+            ]
+            queue_df["Transfer Suggestion"] = [
+                (
+                    f"Move {hint['patient_name']} to {hint['to_bed']}"
+                    if (hint := get_internal_transfer_suggestion(env, patient))
+                    else "None"
+                )
+                for patient in env.waiting_queue
             ]
             st.dataframe(style_patient_dataframe(queue_df), width="stretch")
 
@@ -1468,6 +1763,26 @@ def render_operations(env: HospitalEnv) -> None:
         st.dataframe(style_bed_inventory_dataframe(generate_bed_inventory(env)), width="stretch")
 
         if env.active_patients:
+            soon_discharge = [
+                patient
+                for patient in env.active_patients
+                if int(patient.get("remaining_stay", 9999)) <= 2
+            ]
+            if soon_discharge:
+                st.markdown("**Discharge Alerts (≤ 2 days)**")
+                alert_df = pd.DataFrame(
+                    [
+                        {
+                            "Patient": patient.get("name", f"Patient {patient.get('id', 0)}"),
+                            "Assigned Bed": patient.get("assigned_bed", ""),
+                            "Severity": patient.get("severity", ""),
+                            "Stay Left": patient.get("remaining_stay", 0),
+                        }
+                        for patient in soon_discharge
+                    ]
+                )
+                st.dataframe(style_patient_dataframe(alert_df), width="stretch")
+
             discharge_df = pd.DataFrame(
                 [
                     {
@@ -1482,11 +1797,41 @@ def render_operations(env: HospitalEnv) -> None:
             st.markdown("**Expected Discharge Timeline**")
             st.dataframe(discharge_df, width="stretch")
 
+            st.markdown("**Manual Discharge**")
+            discharge_options = {}
+            for patient in env.active_patients:
+                patient_id = int(patient.get("id", 0))
+                label = (
+                    f"{patient.get('name', f'Patient {patient_id}')}"
+                    f" (ID {patient_id}, {patient.get('assigned_bed', '')} {patient.get('assigned_bed_no', '')})"
+                )
+                discharge_options[label] = patient_id
+            selected_discharge_label = st.selectbox(
+                "Select patient to discharge",
+                list(discharge_options.keys()),
+            )
+            if st.button("Discharge Selected Patient"):
+                discharged = discharge_patient(env, discharge_options[selected_discharge_label])
+                if discharged:
+                    persist_dashboard_state()
+                    st.success("Patient discharged and bed freed.")
+                else:
+                    st.error("Unable to discharge the selected patient.")
+
     with transfer_tab:
         if env.transfer_log:
             st.dataframe(pd.DataFrame(env.transfer_log), width="stretch")
         else:
-            st.caption("No transfers have been recorded yet.")
+            st.caption("No internal or external transfers have been recorded yet.")
+
+        hospital = st.session_state.get("authenticated_hospital")
+        if hospital:
+            external_df = fetch_external_transfers(hospital["hospital_id"])
+            if external_df.empty:
+                st.caption("No external partner transfers logged yet.")
+            else:
+                st.markdown("**External Partner Transfers**")
+                st.dataframe(external_df, width="stretch")
 
     with database_tab:
         hospital = st.session_state.get("authenticated_hospital")
@@ -1505,6 +1850,15 @@ def render_operations(env: HospitalEnv) -> None:
                 st.caption("No allocation history has been stored yet.")
             else:
                 st.dataframe(allocation_df, width="stretch")
+
+    with feedback_tab:
+        hospital = st.session_state.get("authenticated_hospital")
+        if hospital:
+            feedback_df = fetch_rl_feedback(hospital["hospital_id"])
+            if feedback_df.empty:
+                st.caption("No RL feedback has been stored yet.")
+            else:
+                st.dataframe(feedback_df, width="stretch")
 
 
 def render_analytics() -> None:
@@ -1585,6 +1939,14 @@ if st.sidebar.button("Reset Hospital"):
 if st.sidebar.button("Advance One Time Step"):
     get_env().step(3)
     persist_dashboard_state()
+advance_days = st.sidebar.number_input("Advance Days", min_value=1, max_value=14, value=1, step=1)
+if st.sidebar.button("Advance Selected Days"):
+    for _ in range(int(advance_days)):
+        get_env().step(3)
+    persist_dashboard_state()
+if st.sidebar.button("Sync Real-Time Progress"):
+    apply_real_time_progress(get_env())
+    persist_dashboard_state()
 
 env = get_env()
 predictor = load_stay_predictor()
@@ -1600,6 +1962,10 @@ render_sidebar_card(
         f"Admissions {snapshot['active_patients']}",
         f"Transfers {snapshot['transfers']}",
     ],
+)
+render_sidebar_card(
+    "Discharge Alerts",
+    f"{snapshot['discharge_alerts']} patient(s) within 2 days",
 )
 
 if page == "Hospital Setup":
